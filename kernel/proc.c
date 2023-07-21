@@ -23,26 +23,18 @@ extern char trampoline[]; // trampoline.S
 
 // initialize the proc table at boot time.
 void
-procinit(void)
-{
-  struct proc *p;
-  
-  initlock(&pid_lock, "nextpid");
-  for(p = proc; p < &proc[NPROC]; p++) {
-      initlock(&p->lock, "proc");
+procinit(void) {
+    struct proc *p;
 
-      // Allocate a page for the process's kernel stack.
-      // Map it high in memory, followed by an invalid
-      // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
-  }
-  kvminithart();
+    initlock(&pid_lock, "nextpid");
+    for (p = proc; p < &proc[NPROC]; p++) {
+        initlock(&p->lock, "proc");
+        uint64 va = KSTACK((int) (p - proc));
+        p->kstack = va;
+    }
+    kvminithart();
 }
+
 
 // Must be called with interrupts disabled,
 // to prevent race with process being moved
@@ -89,68 +81,86 @@ allocpid() {
 // If found, initialize state required to run in the kernel,
 // and return with p->lock held.
 // If there are no free procs, or a memory allocation fails, return 0.
-static struct proc*
-allocproc(void)
-{
-  struct proc *p;
+static struct proc *
+allocproc(void) {
+    struct proc *p;
 
-  for(p = proc; p < &proc[NPROC]; p++) {
-    acquire(&p->lock);
-    if(p->state == UNUSED) {
-      goto found;
-    } else {
-      release(&p->lock);
+    for (p = proc; p < &proc[NPROC]; p++) {
+        acquire(&p->lock);
+        if (p->state == UNUSED) {
+            goto found;
+        } else {
+            release(&p->lock);
+        }
     }
-  }
-  return 0;
-
-found:
-  p->pid = allocpid();
-
-  // Allocate a trapframe page.
-  if((p->trapframe = (struct trapframe *)kalloc()) == 0){
-    release(&p->lock);
     return 0;
-  }
 
-  // An empty user page table.
-  p->pagetable = proc_pagetable(p);
-  if(p->pagetable == 0){
+    found:
+    p->pid = allocpid();
+
+    // Allocate a trapframe page.
+    if ((p->trapframe = (struct trapframe *) kalloc()) == 0) {
+        release(&p->lock);
+        return 0;
+    }
+
+    // An empty user page table.
+    p->pagetable = proc_pagetable(p);
+    if (p->pagetable == 0) {
+        goto fail;
+    }
+
+    // A kernel page table for process
+    p->kernel_pagetable = proc_kpgtblcreate();
+    if (p->kernel_pagetable == 0) {
+        goto fail;
+    }
+    
+    // Allocate a page for the process's kernel stack.
+    // Map it high in memory, followed by an invalid
+    // guard page.
+    char *pa = (char *) kalloc();
+    if (pa == 0)
+        panic("allocproc: kalloc");
+    uint64 sva = KSTACK((int) (p - proc));
+    uvmmap(p->kernel_pagetable, sva, (uint64) pa, PGSIZE, PTE_R | PTE_W);
+
+    // Set up new context to start executing at forkret,
+    // which returns to user space.
+    memset(&p->context, 0, sizeof(p->context));
+    p->context.ra = (uint64) forkret;
+    p->context.sp = p->kstack + PGSIZE;
+
+    return p;
+
+    fail:
     freeproc(p);
     release(&p->lock);
     return 0;
-  }
-
-  // Set up new context to start executing at forkret,
-  // which returns to user space.
-  memset(&p->context, 0, sizeof(p->context));
-  p->context.ra = (uint64)forkret;
-  p->context.sp = p->kstack + PGSIZE;
-
-  return p;
 }
+
 
 // free a proc structure and the data hanging from it,
 // including user pages.
 // p->lock must be held.
 static void
-freeproc(struct proc *p)
-{
-  if(p->trapframe)
-    kfree((void*)p->trapframe);
-  p->trapframe = 0;
-  if(p->pagetable)
-    proc_freepagetable(p->pagetable, p->sz);
-  p->pagetable = 0;
-  p->sz = 0;
-  p->pid = 0;
-  p->parent = 0;
-  p->name[0] = 0;
-  p->chan = 0;
-  p->killed = 0;
-  p->xstate = 0;
-  p->state = UNUSED;
+freeproc(struct proc *p) {
+    if (p->trapframe)
+        kfree((void *) p->trapframe);
+    p->trapframe = 0;
+    if (p->pagetable)
+        proc_freepagetable(p->pagetable, p->sz);
+    p->pagetable = 0;
+    p->sz = 0;
+    p->pid = 0;
+    p->parent = 0;
+    p->name[0] = 0;
+    p->chan = 0;
+    p->killed = 0;
+    p->xstate = 0;
+    p->state = UNUSED;
 }
+
 
 // Create a user page table for a given process,
 // with no user memory, but with trampoline pages.
@@ -184,6 +194,13 @@ proc_pagetable(struct proc *p)
 
   return pagetable;
 }
+void
+proc_freekpgtbl(pagetable_t kpgtbl, uint64 kstack) {
+    // free the kernel stack page
+    uvmunmap(kpgtbl, kstack, 1, 1);
+
+    uvmkpg_freewalk(kpgtbl);
+}
 
 // Free a process's page table, and free the
 // physical memory it refers to.
@@ -209,96 +226,122 @@ uchar initcode[] = {
 
 // Set up first user process.
 void
-userinit(void)
-{
-  struct proc *p;
+userinit(void) {
+    struct proc *p;
 
-  p = allocproc();
-  initproc = p;
-  
-  // allocate one user page and copy init's instructions
-  // and data into it.
-  uvminit(p->pagetable, initcode, sizeof(initcode));
-  p->sz = PGSIZE;
+    p = allocproc();
+    initproc = p;
 
-  // prepare for the very first "return" from kernel to user.
-  p->trapframe->epc = 0;      // user program counter
-  p->trapframe->sp = PGSIZE;  // user stack pointer
+    // allocate one user page and copy init's instructions
+    // and data into it.
+    uvminit(p->pagetable, initcode, sizeof(initcode));
+    p->sz = PGSIZE;
+    
+    // Copy user mappings to kernel page table
+    if (uvmmap_copy(p->pagetable, p->kernel_pagetable, 0, PGSIZE) < 0)
+        panic("userinit: uvmmap_copy");
 
-  safestrcpy(p->name, "initcode", sizeof(p->name));
-  p->cwd = namei("/");
+    // prepare for the very first "return" from kernel to user.
+    p->trapframe->epc = 0;      // user program counter
+    p->trapframe->sp = PGSIZE;  // user stack pointer
 
-  p->state = RUNNABLE;
+    safestrcpy(p->name, "initcode", sizeof(p->name));
+    p->cwd = namei("/");
 
-  release(&p->lock);
+    p->state = RUNNABLE;
+
+    release(&p->lock);
 }
+
 
 // Grow or shrink user memory by n bytes.
 // Return 0 on success, -1 on failure.
 int
-growproc(int n)
-{
-  uint sz;
-  struct proc *p = myproc();
+growproc(int n) {
+    uint sz;
+    struct proc *p = myproc();
 
-  sz = p->sz;
-  if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
-      return -1;
+    sz = p->sz;
+    uint beg;
+    uint end;
+    if (n > 0) {
+        beg = sz;
+        // prevent user processes from growing larger than the PLIC address.
+        if (sz + n > PLIC || (sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+            return -1;
+        }
+        end = sz;
+        if (end >= beg) {
+            uvmmap_copy(p->pagetable, p->kernel_pagetable, PGROUNDUP(beg), end);
+        }
+
+    } else if (n < 0) {
+        beg = sz;
+        sz = uvmdealloc(p->pagetable, sz, sz + n);
+        end = sz;
+        if (end < beg && PGROUNDUP(end) < PGROUNDUP(beg)) {
+            int npages = (PGROUNDUP(beg) - PGROUNDUP(end)) / PGSIZE;
+            uvmunmap(p->kernel_pagetable, PGROUNDUP(end), npages, 0);
+        }
     }
-  } else if(n < 0){
-    sz = uvmdealloc(p->pagetable, sz, sz + n);
-  }
-  p->sz = sz;
-  return 0;
+    p->sz = sz;
+    return 0;
 }
+
 
 // Create a new process, copying the parent.
 // Sets up child kernel stack to return as if from fork() system call.
 int
-fork(void)
-{
-  int i, pid;
-  struct proc *np;
-  struct proc *p = myproc();
+fork(void) {
+    int i, pid;
+    struct proc *np;
+    struct proc *p = myproc();
 
-  // Allocate process.
-  if((np = allocproc()) == 0){
-    return -1;
-  }
+    // Allocate process.
+    if ((np = allocproc()) == 0) {
+        return -1;
+    }
 
-  // Copy user memory from parent to child.
-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+    // Copy user memory from parent to child.
+    if (uvmcopy(p->pagetable, np->pagetable, p->sz) < 0) {
+        goto fail;
+    }
+    np->sz = p->sz;
+
+    // Copy user mappings to kernel page table
+    if (uvmmap_copy(np->pagetable, np->kernel_pagetable, 0, np->sz) < 0) {
+        goto fail;
+    }
+    np->parent = p;
+
+    // copy saved user registers.
+    *(np->trapframe) = *(p->trapframe);
+
+    // Cause fork to return 0 in the child.
+    np->trapframe->a0 = 0;
+
+    // increment reference counts on open file descriptors.
+    for (i = 0; i < NOFILE; i++)
+        if (p->ofile[i])
+            np->ofile[i] = filedup(p->ofile[i]);
+    np->cwd = idup(p->cwd);
+
+    safestrcpy(np->name, p->name, sizeof(p->name));
+
+    pid = np->pid;
+
+    np->state = RUNNABLE;
+
+    release(&np->lock);
+
+    return pid;
+
+    fail:
     freeproc(np);
     release(&np->lock);
     return -1;
-  }
-  np->sz = p->sz;
-
-  np->parent = p;
-
-  // copy saved user registers.
-  *(np->trapframe) = *(p->trapframe);
-
-  // Cause fork to return 0 in the child.
-  np->trapframe->a0 = 0;
-
-  // increment reference counts on open file descriptors.
-  for(i = 0; i < NOFILE; i++)
-    if(p->ofile[i])
-      np->ofile[i] = filedup(p->ofile[i]);
-  np->cwd = idup(p->cwd);
-
-  safestrcpy(np->name, p->name, sizeof(p->name));
-
-  pid = np->pid;
-
-  np->state = RUNNABLE;
-
-  release(&np->lock);
-
-  return pid;
 }
+
 
 // Pass p's abandoned children to init.
 // Caller must hold p->lock.
@@ -454,45 +497,50 @@ wait(uint64 addr)
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
 void
-scheduler(void)
-{
-  struct proc *p;
-  struct cpu *c = mycpu();
-  
-  c->proc = 0;
-  for(;;){
-    // Avoid deadlock by ensuring that devices can interrupt.
-    intr_on();
-    
-    int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
+scheduler(void) {
+    struct proc *p;
+    struct cpu *c = mycpu();
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
+    c->proc = 0;
+    for (;;) {
+        // Avoid deadlock by ensuring that devices can interrupt.
+        intr_on();
 
-        found = 1;
-      }
-      release(&p->lock);
-    }
+        int found = 0;
+        for (p = proc; p < &proc[NPROC]; p++) {
+            acquire(&p->lock);
+            if (p->state == RUNNABLE) {
+                // Switch to chosen process.  It is the process's job
+                // to release its lock and then reacquire it
+                // before jumping back to us.
+                p->state = RUNNING;
+                c->proc = p;
+                // use process's kernel page table instead
+                w_satp(MAKE_SATP(p->kernel_pagetable));
+                sfence_vma();
+
+                swtch(&c->context, &p->context);
+
+                // use global kernel page table
+                kvminithart();
+                // Process is done running for now.
+                // It should have changed its p->state before coming back.
+                c->proc = 0;
+                found = 1;
+            }
+            release(&p->lock);
+        }
 #if !defined (LAB_FS)
-    if(found == 0) {
-      intr_on();
-      asm volatile("wfi");
-    }
+        if (found == 0) {
+            intr_on();
+            asm volatile("wfi");
+        }
 #else
-    ;
+        ;
 #endif
-  }
+    }
 }
+
 
 // Switch to scheduler.  Must hold only p->lock
 // and have changed proc->state. Saves and restores

@@ -1,0 +1,6 @@
+Q1
+exec随后又分配了2页物理内存，一页用于用户栈，一页用于防止栈溢出覆盖其他数据。栈地址sp和保护页地址stackbase与图3.4所示相同：
+栈位于高地址，保护页位于低地址，两者地址相差1页；可以猜测：guard page是page1，用户模式(user mode)下不可访问。stack是page2，即用户栈，包含的是进程在栈上保存的一些本地变量、参数等。
+Q2
+参数srcva 和 len 都是64位无符号整数，无符号整数加法发生溢出时，得到的结果是正数，但会比srcva和len都要小。
+因此srcva + len < srcva是用来检测溢出的。比如 srcva = 4096， len = UINT64MAX - 4095的情况；srcva >= p->sz(false)、src + len >= p->sz(发生溢出，0 >= p->sz， false)、srcva + len < srcva(0 < p->sz, true)。可见，如果没有这个溢出判断，就会复制用户空间之外的内存，可能导致内核被破坏。
