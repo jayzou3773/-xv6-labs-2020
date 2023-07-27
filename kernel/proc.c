@@ -13,6 +13,7 @@ struct proc proc[NPROC];
 struct proc *initproc;
 
 int nextpid = 1;
+int cpuid(void);
 struct spinlock pid_lock;
 
 extern void forkret(void);
@@ -126,6 +127,10 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+  p->interval = 0;
+  p->handler = 0;
+  p->passedticks = 0;
+  p->trapframecopy = 0;
 
   return p;
 }
